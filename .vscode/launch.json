@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+    
+        {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": ["--mrb_dir","C:/Users/lucp13173/Documents/Data/CAPS/Jessa/Segmented", "--nnunet_raw","C:/Users/lucp13173/Documents/Data/CAPS/Jessa//nnUNet_raw", "--prepare-only"]
+        }
+    ]
+}
