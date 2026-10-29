@@ -3,12 +3,19 @@ import os
 import json
 import csv
 
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="no available indices of class 2 to crop"
+)
+
 import torch
 import numpy as np
 
 from monai.data import Dataset, DataLoader, decollate_batch
 from monai.inferers import sliding_window_inference
-from monai.losses import DiceCELoss
+from monai.losses import DiceCELoss, DiceLoss
 from monai.metrics import DiceMetric
 from monai.networks.nets import SwinUNETR
 
@@ -24,6 +31,7 @@ from monai.transforms import (
     ScaleIntensityRanged,
     CropForegroundd,
     RandCropByPosNegLabeld,
+    RandCropByLabelClassesd,
     RandFlipd,
     RandRotate90d,
     RandScaleIntensityd,
@@ -175,13 +183,17 @@ train_transforms = Compose([
         source_key="image"
     ),
 
-    RandCropByPosNegLabeld(
+    RandCropByLabelClassesd(
         keys=["image", "label"],
         label_key="label",
         spatial_size=ROI_SIZE,
-        pos=2,
-        neg=1,
-        num_samples=2,
+    
+        # background, pancreas, tumour
+        ratios=[0.1, 0.2, 0.7],
+    
+        num_classes=3,
+        num_samples=4,
+    
         image_key="image",
         image_threshold=0
     ),
@@ -525,10 +537,21 @@ def train_fold(fold):
     # Loss
     # --------------------------------------------------------
 
-    loss_function = DiceCELoss(
+    dice_loss_function = DiceLoss(
         to_onehot_y=True,
         softmax=True,
         include_background=False
+    )
+    
+    ce_loss_function = torch.nn.CrossEntropyLoss(
+        weight=torch.tensor(
+            [
+                0.2,   # background
+                1.0,   # pancreas
+                4.0    # tumour
+            ],
+            device=device
+        )
     )
 
     optimizer = torch.optim.AdamW(
@@ -607,10 +630,17 @@ def train_fold(fold):
 
                 outputs = model(images)
 
-                loss = loss_function(
+                dice_loss = dice_loss_function(
                     outputs,
                     labels
                 )
+                
+                ce_loss = ce_loss_function(
+                    outputs,
+                    labels[:, 0].long()
+                )
+                
+                loss = dice_loss + ce_loss
 
             scaler.scale(loss).backward()
 
@@ -807,5 +837,17 @@ def train_fold(fold):
 
 if __name__ == "__main__":
 
-    for fold in range(N_FOLDS):
-        train_fold(fold)
+    import argparse
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--fold",
+        type=int,
+        required=True,
+        choices=range(5)
+    )
+
+    args = parser.parse_args()
+
+    train_fold(args.fold)

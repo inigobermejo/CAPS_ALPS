@@ -2,6 +2,12 @@ from pathlib import Path
 import os
 import json
 import csv
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="no available indices of class 2 to crop"
+)
 
 import numpy as np
 import torch
@@ -10,15 +16,17 @@ import SimpleITK as sitk
 from nnunet_mednext import create_mednext_v1
 
 from monai.data import (
+    Dataset,
     DataLoader,
     PersistentDataset,
     decollate_batch,
 )
 
 from monai.inferers import sliding_window_inference
-from monai.losses import DiceCELoss
+from monai.losses import DiceLoss
 
 from monai.transforms import (
+    AsDiscreted,
     Compose,
     LoadImaged,
     EnsureChannelFirstd,
@@ -28,6 +36,7 @@ from monai.transforms import (
     CropForegroundd,
     SpatialPadd,
     RandCropByPosNegLabeld,
+    RandCropByLabelClassesd,
     RandFlipd,
     RandRotate90d,
     RandScaleIntensityd,
@@ -82,8 +91,8 @@ WEIGHT_DECAY = 1e-5
 NUM_CLASSES = 3
 
 # Same preprocessing as Swin UNETR
-ROI_SIZE = (96, 96, 96)
-SPACING = (1.5, 1.5, 2.0)
+ROI_SIZE = (128, 128, 96)
+SPACING = (1.0, 1.0, 2.0)
 
 HU_MIN = -175
 HU_MAX = 250
@@ -192,15 +201,19 @@ train_transforms = Compose([
         spatial_size=ROI_SIZE
     ),
 
-    RandCropByPosNegLabeld(
+    RandCropByLabelClassesd(
         keys=["image", "label"],
         label_key="label",
         spatial_size=ROI_SIZE,
-        pos=2,
-        neg=1,
-        num_samples=NUM_SAMPLES,
-        image_key="image",
-        image_threshold=0
+    
+        # background, pancreas, tumour
+        ratios=[0.1, 0.2, 0.7],
+    
+        num_classes=3,
+        num_samples=4,
+    
+        # Do not restrict sampling using image intensity
+        image_key=None,
     ),
 
     RandFlipd(
@@ -455,15 +468,21 @@ def save_predictions(
     # Reverse preprocessing:
     # padding -> crop -> spacing -> orientation
     post_transform = Compose([
-
         Invertd(
             keys="pred",
             transform=val_transforms,
             orig_keys="image",
-            nearest_interp=True,
-            to_tensor=True
-        )
-
+    
+            # logits are continuous
+            nearest_interp=False,
+    
+            to_tensor=True,
+        ),
+    
+        AsDiscreted(
+            keys="pred",
+            argmax=True,
+        ),
     ])
 
     model.eval()
@@ -490,13 +509,7 @@ def save_predictions(
                 )
 
             # Discrete segmentation in preprocessed space
-            pred = torch.argmax(
-                logits,
-                dim=1,
-                keepdim=True
-            )
-
-            batch["pred"] = pred
+            batch["pred"] = logits.detach().cpu()
 
             # Invertd operates case-by-case
             item = decollate_batch(batch)[0]
@@ -624,14 +637,9 @@ def train_fold(fold):
         )
     )
 
-    val_ds = PersistentDataset(
+    val_ds = Dataset(
         data=val_files,
-        transform=val_transforms,
-        cache_dir=(
-            CACHE_DIR
-            / f"fold_{fold}"
-            / "val"
-        )
+        transform=val_transforms
     )
 
     train_loader = DataLoader(
@@ -683,10 +691,21 @@ def train_fold(fold):
     # LOSS / OPTIMIZER
     # ========================================================
 
-    loss_function = DiceCELoss(
+    dice_loss_function = DiceLoss(
         to_onehot_y=True,
         softmax=True,
         include_background=False
+    )
+    
+    ce_loss_function = torch.nn.CrossEntropyLoss(
+        weight=torch.tensor(
+            [
+                0.2,   # background
+                1.0,   # pancreas
+                4.0,   # tumour
+            ],
+            device=device
+        )
     )
 
     optimizer = torch.optim.AdamW(
@@ -758,11 +777,18 @@ def train_fold(fold):
             ):
 
                 outputs = model(images)
-
-                loss = loss_function(
+                
+                dice_loss = dice_loss_function(
                     outputs,
                     labels
                 )
+                
+                ce_loss = ce_loss_function(
+                    outputs,
+                    labels[:, 0].long()
+                )
+                
+                loss = dice_loss + ce_loss
 
             scaler.scale(loss).backward()
 

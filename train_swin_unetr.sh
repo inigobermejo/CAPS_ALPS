@@ -10,7 +10,7 @@
 #SBATCH --time=08:00:00
 #SBATCH --exclude=k28g30
 #SBATCH --job-name=CAPS_ALPS_train_swinunetr
-#SBATCH --output=inference_ensemble_%j.out
+#SBATCH --output=CAPS_ALPS_train_swinunetr_%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=inigo.bermejo@uhasselt.be
 
@@ -48,7 +48,7 @@ hostname
 echo "Starting"
 date
 
-python ${DATA_DIR}/CAPS/Scripts/ALPS/train_swin_unetr.py
+python ${DATA_DIR}/CAPS/Scripts/ALPS/train_swin_unetr.py --fold 0
 
 echo "Finished"
 date

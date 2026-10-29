@@ -9,8 +9,8 @@
 #SBATCH --mem=126000MB
 #SBATCH --time=08:00:00
 #SBATCH --exclude=k28g30
-#SBATCH --job-name=CAPS_ALPS_train_nnUnet
-#SBATCH --output=inference_ensemble_%j.out
+#SBATCH --job-name=CAPS_ALPS_train_mednext
+#SBATCH --output=CAPS_ALPS_train_mednext_%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=inigo.bermejo@uhasselt.be
 

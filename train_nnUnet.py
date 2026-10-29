@@ -28,9 +28,12 @@ VSC_USER="vsc36501"
 
 # Data directory
 DATA_DIR= f"/data/leuven/{PROJECT}/{VSC_USER}"
+CAPS_DATA_DIR= f"{DATA_DIR}/CAPS"
 
 # Common dataset 
-COMMON_DATASET = Path(f"{DATA_DIR}/CAPS/Jessa/Preprocessed")
+#COMMON_DATASET = Path(f"{DATA_DIR}/CAPS/Jessa/Preprocessed")
+#COMMON_DATASET = Path(f"{DATA_DIR}/CAPS/MSD_Task07")
+COMMON_DATASET = Path(f"{DATA_DIR}/CAPS/Jessa/nnUNet/nnUNet_raw/Dataset003_JessaMultiOrgan")
 
 # nnU-Net folders
 NNUNET_RAW = Path(
@@ -48,8 +51,12 @@ NNUNET_RESULTS = Path(
 PREDICTIONS_ROOT = Path(f"{NNUNET_RESULTS}/predictions") 
 
 # Dataset number/name
-DATASET_ID = 1
-DATASET_NAME = "PancreasTumor"
+#DATASET_ID = 1
+#DATASET_NAME = "PancreasTumor"
+#DATASET_ID = 2
+#DATASET_NAME = "MSDPancreas"
+DATASET_ID = 3
+DATASET_NAME = "JessaMultiOrgan"
 
 DATASET_FOLDER = f"Dataset{DATASET_ID:03d}_{DATASET_NAME}"
 
@@ -122,19 +129,34 @@ def prepare_raw_dataset():
     n_cases = len(
         list(labels_target.glob("*.nii.gz"))
     )
-
+    
     dataset_json = {
         "channel_names": {
             "0": "CT"
         },
+    
         "labels": {
             "background": 0,
-            "pancreas": 1,
-            "tumor": 2
+            "aorta": 1,
+            "celiac_artery": 2,
+            "common_bile_duct": 3,
+            "duodenum": 4,
+            "pancreas": 5,
+            "pancreatic_duct": 6,
+            "IVC": 7,
+            "spleen": 8,
+            "SMA": 9,
+            "pancreatic_lesion_tumor": 10,
+            "portal_vein": 11,
+            "SMV": 12,
+            "splenic_vein": 13,
+            "IMV": 14
         },
+    
         "numTraining": n_cases,
+    
         "file_ending": ".nii.gz"
-    }
+    }    
 
     with open(
         target / "dataset.json",
@@ -163,7 +185,11 @@ def preprocess():
         "nnUNetv2_plan_and_preprocess",
         "-d",
         str(DATASET_ID),
-        "--verify_dataset_integrity"
+        "-c",
+        "3d_fullres",
+        "--verify_dataset_integrity",
+        "-pl",
+        "nnUNetPlannerResEncL",
     ])
 
 
@@ -460,7 +486,9 @@ def train_fold(fold):
         str(DATASET_ID),
         CONFIGURATION,
         str(fold),
-        "--val_best"
+        "--val_best",
+        "-p",
+        "nnUNetResEncUNetLPlans"
     ])
     export_training_history(fold)
 
@@ -479,10 +507,28 @@ def train():
 
 if __name__ == "__main__":
 
-    prepare_raw_dataset()
+    import argparse
 
-    preprocess()
+    parser = argparse.ArgumentParser()
 
-    create_nnunet_splits()
+    parser.add_argument(
+        "--preprocess",
+        action="store_true",
+        help="Run nnU-Net planning and preprocessing"
+    )
 
-    train()
+    parser.add_argument(
+        "--fold",
+        type=int,
+        default=0,
+        choices=range(5)
+    )
+
+    args = parser.parse_args()
+
+    if args.preprocess:
+        prepare_raw_dataset()
+        preprocess()
+        create_nnunet_splits()
+
+    train_fold(args.fold)
