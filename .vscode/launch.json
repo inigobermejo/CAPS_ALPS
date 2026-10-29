@@ -8,7 +8,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "args": ["--mrb_dir","C:/Users/lucp13173/Documents/Data/CAPS/Jessa/Segmented", "--nnunet_raw","C:/Users/lucp13173/Documents/Data/CAPS/Jessa//nnUNet_raw", "--prepare-only"]
+            "args": []
         }
     ]
 }

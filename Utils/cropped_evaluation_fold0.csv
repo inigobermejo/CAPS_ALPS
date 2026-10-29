@@ -1,0 +1,11 @@
+case,gt_voxels,pred_voxels,dice,precision,recall
+CAPS1090.v-validated,0,0,nan,nan,nan
+CAPS1320.v-validated,9298,0,0.0,nan,0.0
+CAPS1520.v-validated,125,0,0.0,nan,0.0
+CAPS1630.v-validated,5341,0,0.0,nan,0.0
+CAPS1990.v-validated,3375,0,0.0,nan,0.0
+CAPS2480.v-validated,354,0,0.0,nan,0.0
+CAPS3580.v-validated,4006,0,0.0,nan,0.0
+CAPS3870.v-validated,116,0,0.0,nan,0.0
+CAPS4080.v-validated,293,0,0.0,nan,0.0
+CAPS4710.v-validated,0,0,nan,nan,nan

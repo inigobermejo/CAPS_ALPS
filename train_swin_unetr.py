@@ -1,17 +1,22 @@
-# train_swin_unetr.py
-
+from pathlib import Path
 import os
 import json
-import argparse
-import random
-from pathlib import Path
+import csv
 
-import numpy as np
 import torch
+import numpy as np
 
-from monai.data import Dataset, DataLoader
+from monai.data import Dataset, DataLoader, decollate_batch
+from monai.inferers import sliding_window_inference
+from monai.losses import DiceCELoss
+from monai.metrics import DiceMetric
+from monai.networks.nets import SwinUNETR
+
+import SimpleITK as sitk
+
 from monai.transforms import (
     Compose,
+    Invertd,
     LoadImaged,
     EnsureChannelFirstd,
     Orientationd,
@@ -21,38 +26,63 @@ from monai.transforms import (
     RandCropByPosNegLabeld,
     RandFlipd,
     RandRotate90d,
+    RandScaleIntensityd,
     RandShiftIntensityd,
     EnsureTyped,
+    AsDiscrete,
 )
 
-from monai.networks.nets import SwinUNETR
-from monai.losses import DiceCELoss
-from monai.metrics import DiceMetric
-from monai.inferers import sliding_window_inference
-
 
 # ============================================================
-# CONFIGURATION
+# SETTINGS
 # ============================================================
+# VSC project number
+PROJECT="365"
 
-PATCH_SIZE = (96, 96, 96)
+# VSC username
+VSC_USER="vsc36501"
 
-NUM_CLASSES = 3
-IN_CHANNELS = 1
+# Data directory
+DATA_DIR= f"/data/leuven/{PROJECT}/{VSC_USER}"
 
-FEATURE_SIZE = 48
+# Model
+MODEL_NAME = "SwinUNETR"
+
+# Common dataset 
+DATASET_DIR = Path(f"{DATA_DIR}/CAPS/Jessa/Preprocessed")
+
+RESULTS_DIR = Path(os.environ["SwinUNETR_results"])
+
+RESULTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+N_FOLDS = 5
+
+MAX_EPOCHS = 300
+VAL_EVERY = 5
 
 BATCH_SIZE = 1
-NUM_SAMPLES_PER_VOLUME = 4
-
-MAX_EPOCHS = 500
+NUM_WORKERS = 4
 
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
 
-VAL_EVERY = 5
+ROI_SIZE = (96, 96, 96)
 
-NUM_WORKERS = 4
+# MONAI Swin UNETR abdominal CT defaults
+SPACING = (1.5, 1.5, 2.0)
+
+HU_MIN = -175
+HU_MAX = 250
+
+FEATURE_SIZE = 48
+
+NUM_CLASSES = 3
+
+SW_BATCH_SIZE = 2
+INFER_OVERLAP = 0.5
 
 SEED = 42
 
@@ -61,362 +91,444 @@ SEED = 42
 # REPRODUCIBILITY
 # ============================================================
 
-def set_seed(seed):
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
-    random.seed(seed)
-    np.random.seed(seed)
-
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = True
 
 
 # ============================================================
-# DATA
+# LOAD FOLDS
 # ============================================================
 
-def get_case_files(data_dir):
+with open(
+    DATASET_DIR / "folds.json"
+) as f:
+    fold_data = json.load(f)
 
-    data_dir = Path(data_dir)
+folds = fold_data["folds"]
 
-    images_dir = data_dir / "imagesTr"
-    labels_dir = data_dir / "labelsTr"
+all_cases = sorted(
+    p.name.replace(".nii.gz", "")
+    for p in (DATASET_DIR / "labelsTr").glob("*.nii.gz")
+)
 
-    cases = []
 
-    for image_file in sorted(images_dir.glob("*_0000.nii.gz")):
+def make_case(case_id):
 
-        case_id = image_file.name.replace("_0000.nii.gz", "")
+    return {
+        "image":
+            str(
+                DATASET_DIR
+                / "imagesTr"
+                / f"{case_id}_0000.nii.gz"
+            ),
 
-        label_file = labels_dir / f"{case_id}.nii.gz"
+        "label":
+            str(
+                DATASET_DIR
+                / "labelsTr"
+                / f"{case_id}.nii.gz"
+            ),
 
-        if not label_file.exists():
-            raise FileNotFoundError(
-                f"Missing label for {case_id}: {label_file}"
-            )
-
-        cases.append(
-            {
-                "image": str(image_file),
-                "label": str(label_file),
-                "case_id": case_id,
-            }
-        )
-
-    print(f"Found {len(cases)} cases")
-
-    return cases
+        "case_id":
+            case_id
+    }
 
 
 # ============================================================
 # TRANSFORMS
 # ============================================================
 
-def get_train_transforms():
+train_transforms = Compose([
 
-    return Compose([
+    LoadImaged(
+        keys=["image", "label"]
+    ),
 
-        LoadImaged(
-            keys=["image", "label"]
-        ),
+    EnsureChannelFirstd(
+        keys=["image", "label"]
+    ),
 
-        EnsureChannelFirstd(
-            keys=["image", "label"]
-        ),
+    Orientationd(
+        keys=["image", "label"],
+        axcodes="RAS"
+    ),
 
-        Orientationd(
-            keys=["image", "label"],
-            axcodes="RAS"
-        ),
+    Spacingd(
+        keys=["image", "label"],
+        pixdim=SPACING,
+        mode=("bilinear", "nearest")
+    ),
 
-        Spacingd(
-            keys=["image", "label"],
-            pixdim=(1.0, 1.0, 2.0),
-            mode=("bilinear", "nearest")
-        ),
+    ScaleIntensityRanged(
+        keys=["image"],
+        a_min=HU_MIN,
+        a_max=HU_MAX,
+        b_min=0.0,
+        b_max=1.0,
+        clip=True
+    ),
 
-        ScaleIntensityRanged(
-            keys=["image"],
-            a_min=-150,
-            a_max=250,
-            b_min=0.0,
-            b_max=1.0,
-            clip=True
-        ),
+    CropForegroundd(
+        keys=["image", "label"],
+        source_key="image"
+    ),
 
-        CropForegroundd(
-            keys=["image", "label"],
-            source_key="image"
-        ),
+    RandCropByPosNegLabeld(
+        keys=["image", "label"],
+        label_key="label",
+        spatial_size=ROI_SIZE,
+        pos=2,
+        neg=1,
+        num_samples=2,
+        image_key="image",
+        image_threshold=0
+    ),
 
-        RandCropByPosNegLabeld(
-            keys=["image", "label"],
-            label_key="label",
-            spatial_size=PATCH_SIZE,
-            pos=2,
-            neg=1,
-            num_samples=NUM_SAMPLES_PER_VOLUME,
-            image_key="image",
-            image_threshold=0
-        ),
+    RandFlipd(
+        keys=["image", "label"],
+        spatial_axis=0,
+        prob=0.2
+    ),
 
-        RandFlipd(
-            keys=["image", "label"],
-            spatial_axis=0,
-            prob=0.5
-        ),
+    RandFlipd(
+        keys=["image", "label"],
+        spatial_axis=1,
+        prob=0.2
+    ),
 
-        RandFlipd(
-            keys=["image", "label"],
-            spatial_axis=1,
-            prob=0.5
-        ),
+    RandFlipd(
+        keys=["image", "label"],
+        spatial_axis=2,
+        prob=0.2
+    ),
 
-        RandFlipd(
-            keys=["image", "label"],
-            spatial_axis=2,
-            prob=0.5
-        ),
+    RandRotate90d(
+        keys=["image", "label"],
+        prob=0.2,
+        max_k=3
+    ),
 
-        RandRotate90d(
-            keys=["image", "label"],
-            prob=0.5,
-            max_k=3
-        ),
+    RandScaleIntensityd(
+        keys=["image"],
+        factors=0.1,
+        prob=0.1
+    ),
 
-        RandShiftIntensityd(
-            keys=["image"],
-            offsets=0.1,
-            prob=0.5
-        ),
+    RandShiftIntensityd(
+        keys=["image"],
+        offsets=0.1,
+        prob=0.1
+    ),
 
-        EnsureTyped(
-            keys=["image", "label"]
-        )
-    ])
-
-
-def get_val_transforms():
-
-    return Compose([
-
-        LoadImaged(
-            keys=["image", "label"]
-        ),
-
-        EnsureChannelFirstd(
-            keys=["image", "label"]
-        ),
-
-        Orientationd(
-            keys=["image", "label"],
-            axcodes="RAS"
-        ),
-
-        Spacingd(
-            keys=["image", "label"],
-            pixdim=(1.0, 1.0, 2.0),
-            mode=("bilinear", "nearest")
-        ),
-
-        ScaleIntensityRanged(
-            keys=["image"],
-            a_min=-150,
-            a_max=250,
-            b_min=0.0,
-            b_max=1.0,
-            clip=True
-        ),
-
-        CropForegroundd(
-            keys=["image", "label"],
-            source_key="image"
-        ),
-
-        EnsureTyped(
-            keys=["image", "label"]
-        )
-    ])
+    EnsureTyped(
+        keys=["image", "label"]
+    )
+])
 
 
-# ============================================================
-# MODEL
-# ============================================================
+val_transforms = Compose([
 
-def create_model(device):
+    LoadImaged(
+        keys=["image", "label"]
+    ),
 
-    model = SwinUNETR(
-        in_channels=IN_CHANNELS,
-        out_channels=NUM_CLASSES,
-        feature_size=FEATURE_SIZE,
-        use_checkpoint=True,
-        spatial_dims=3
+    EnsureChannelFirstd(
+        keys=["image", "label"]
+    ),
+
+    Orientationd(
+        keys=["image", "label"],
+        axcodes="RAS"
+    ),
+
+    Spacingd(
+        keys=["image", "label"],
+        pixdim=SPACING,
+        mode=("bilinear", "nearest")
+    ),
+
+    ScaleIntensityRanged(
+        keys=["image"],
+        a_min=HU_MIN,
+        a_max=HU_MAX,
+        b_min=0.0,
+        b_max=1.0,
+        clip=True
+    ),
+
+    CropForegroundd(
+        keys=["image", "label"],
+        source_key="image"
+    ),
+
+    EnsureTyped(
+        keys=["image", "label"],
+        track_meta=True
+    )
+])
+
+post_transforms = Compose([
+
+    Invertd(
+        keys="pred",
+        transform=val_transforms,
+        orig_keys="image",
+        nearest_interp=True,
+        to_tensor=True
     )
 
-    return model.to(device)
-
+])
 
 # ============================================================
-# TRAINING
+# SAVE VALIDATION PREDICTIONS
 # ============================================================
 
-def train_one_epoch(
+def save_validation_predictions(
     model,
-    loader,
-    optimizer,
-    loss_function,
-    scaler,
+    val_loader,
+    fold,
     device
 ):
 
-    model.train()
+    print()
+    print(
+        f"Saving validation predictions "
+        f"for fold {fold}..."
+    )
 
-    epoch_loss = 0
+    output_dir = (
+        RESULTS_DIR.parent
+        / "predictions"
+        / "swin_unetr"
+        / f"fold_{fold}"
+    )
 
-    for batch in loader:
-
-        images = batch["image"].to(device)
-        labels = batch["label"].to(device)
-
-        optimizer.zero_grad(set_to_none=True)
-
-        with torch.cuda.amp.autocast():
-
-            outputs = model(images)
-
-            loss = loss_function(
-                outputs,
-                labels
+    # Or, if using the common environment variable:
+    output_dir = (
+        Path(
+            os.environ.get(
+                "PREDICTIONS_ROOT",
+                "./predictions"
             )
+        )
+        / "swin_unetr"
+        / f"fold_{fold}"
+    )
 
-        scaler.scale(loss).backward()
-
-        scaler.step(optimizer)
-        scaler.update()
-
-        epoch_loss += loss.item()
-
-    return epoch_loss / len(loader)
-
-
-# ============================================================
-# VALIDATION
-# ============================================================
-
-@torch.no_grad()
-def validate(
-    model,
-    loader,
-    device
-):
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     model.eval()
 
-    dice_metric = DiceMetric(
-        include_background=False,
-        reduction="mean",
-        get_not_nans=False
-    )
+    with torch.no_grad():
 
-    for batch in loader:
+        for batch in val_loader:
 
-        images = batch["image"].to(device)
-        labels = batch["label"].to(device)
+            case_id = batch["case_id"][0]
 
-        outputs = sliding_window_inference(
-            inputs=images,
-            roi_size=PATCH_SIZE,
-            sw_batch_size=1,
-            predictor=model,
-            overlap=0.5
-        )
+            images = batch["image"].to(device)
 
-        predictions = torch.argmax(
-            outputs,
-            dim=1,
-            keepdim=True
-        )
+            # ----------------------------------------------
+            # Prediction in Swin preprocessing space
+            # ----------------------------------------------
 
-        predictions_onehot = torch.nn.functional.one_hot(
-            predictions[:, 0].long(),
-            num_classes=NUM_CLASSES
-        )
+            with torch.autocast(
+                device_type="cuda",
+                enabled=torch.cuda.is_available()
+            ):
 
-        predictions_onehot = predictions_onehot.permute(
-            0, 4, 1, 2, 3
-        ).float()
+                logits = sliding_window_inference(
+                    inputs=images,
+                    roi_size=ROI_SIZE,
+                    sw_batch_size=SW_BATCH_SIZE,
+                    predictor=model,
+                    overlap=INFER_OVERLAP
+                )
 
-        labels_onehot = torch.nn.functional.one_hot(
-            labels[:, 0].long(),
-            num_classes=NUM_CLASSES
-        )
+            # Convert probabilities/logits to discrete labels
+            pred = torch.argmax(
+                logits,
+                dim=1,
+                keepdim=True
+            )
 
-        labels_onehot = labels_onehot.permute(
-            0, 4, 1, 2, 3
-        ).float()
+            # Store prediction in the MONAI dictionary so
+            # Invertd can use the image transform history.
+            batch["pred"] = pred
 
-        dice_metric(
-            predictions_onehot,
-            labels_onehot
-        )
+            # batch_size = 1 here
+            item = decollate_batch(batch)[0]
 
-    dice = dice_metric.aggregate().item()
+            # ----------------------------------------------
+            # Reverse:
+            # crop -> spacing -> orientation
+            # ----------------------------------------------
 
-    dice_metric.reset()
+            item = post_transforms(item)
 
-    return dice
+            pred_original = (
+                item["pred"]
+                .squeeze()
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.uint8)
+            )
+
+            # ----------------------------------------------
+            # Force exact geometry of our common GT
+            # ----------------------------------------------
+
+            gt_file = (
+                DATASET_DIR
+                / "labelsTr"
+                / f"{case_id}.nii.gz"
+            )
+
+            gt_img = sitk.ReadImage(
+                str(gt_file)
+            )
+
+            # MONAI/NIfTI array order here is X,Y,Z.
+            # SimpleITK GetImageFromArray expects Z,Y,X.
+            expected_shape = tuple(
+                gt_img.GetSize()
+            )
+
+            if pred_original.shape != expected_shape:
+
+                raise RuntimeError(
+                    f"{case_id}: restored prediction "
+                    f"shape {pred_original.shape} "
+                    f"does not match original "
+                    f"{expected_shape}"
+                )
+
+            pred_zyx = np.transpose(
+                pred_original,
+                (2, 1, 0)
+            )
+
+            pred_img = sitk.GetImageFromArray(
+                pred_zyx
+            )
+
+            # This guarantees spacing/origin/direction are
+            # identical to our common dataset.
+            pred_img.CopyInformation(
+                gt_img
+            )
+
+            output_file = (
+                output_dir
+                / f"{case_id}.nii.gz"
+            )
+
+            sitk.WriteImage(
+                pred_img,
+                str(output_file),
+                useCompression=True
+            )
+
+            print(
+                f"  saved {case_id}"
+            )
 
 
 # ============================================================
-# MAIN TRAINING
+# TRAIN ONE FOLD
 # ============================================================
 
-def train_fold(
-    train_cases,
-    val_cases,
-    fold,
-    output_dir,
-    device
-):
+def train_fold(fold):
 
     print()
     print("=" * 70)
     print(f"TRAINING FOLD {fold}")
     print("=" * 70)
 
-    train_dataset = Dataset(
-        data=train_cases,
-        transform=get_train_transforms()
+    val_cases = folds[str(fold)]
+
+    train_cases = [
+        c for c in all_cases
+        if c not in val_cases
+    ]
+
+    print(
+        f"Training cases:   {len(train_cases)}"
     )
 
-    val_dataset = Dataset(
-        data=val_cases,
-        transform=get_val_transforms()
+    print(
+        f"Validation cases: {len(val_cases)}"
+    )
+
+    train_files = [
+        make_case(c)
+        for c in train_cases
+    ]
+
+    val_files = [
+        make_case(c)
+        for c in val_cases
+    ]
+
+    # --------------------------------------------------------
+    # Datasets / loaders
+    # --------------------------------------------------------
+
+    train_ds = Dataset(
+        data=train_files,
+        transform=train_transforms
+    )
+
+    val_ds = Dataset(
+        data=val_files,
+        transform=val_transforms
     )
 
     train_loader = DataLoader(
-        train_dataset,
+        train_ds,
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=True
     )
 
     val_loader = DataLoader(
-        val_dataset,
+        val_ds,
         batch_size=1,
         shuffle=False,
         num_workers=NUM_WORKERS,
-        pin_memory=torch.cuda.is_available()
+        pin_memory=True
     )
 
-    model = create_model(device)
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    model = SwinUNETR(
+        in_channels=1,
+        out_channels=NUM_CLASSES,
+        feature_size=FEATURE_SIZE,
+        use_checkpoint=True
+    ).to(device)
+
+    # --------------------------------------------------------
+    # Loss
+    # --------------------------------------------------------
 
     loss_function = DiceCELoss(
-        include_background=True,
         to_onehot_y=True,
-        softmax=True
+        softmax=True,
+        include_background=False
     )
 
     optimizer = torch.optim.AdamW(
@@ -430,255 +542,270 @@ def train_fold(
         T_max=MAX_EPOCHS
     )
 
-    scaler = torch.cuda.amp.GradScaler()
+    # --------------------------------------------------------
+    # Dice metric
+    # --------------------------------------------------------
 
-    fold_dir = Path(output_dir) / f"fold_{fold}"
+    dice_metric = DiceMetric(
+        include_background=False,
+        reduction="mean_batch"
+    )
+
+    post_pred = AsDiscrete(
+        argmax=True,
+        to_onehot=NUM_CLASSES
+    )
+
+    post_label = AsDiscrete(
+        to_onehot=NUM_CLASSES
+    )
+
+    # Mixed precision
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=torch.cuda.is_available()
+    )
+
+    best_dice = -1
+    best_epoch = -1
+
+    fold_dir = (
+        RESULTS_DIR
+        / f"fold_{fold}"
+    )
+
     fold_dir.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    best_dice = -1
-
     history = []
 
-    for epoch in range(1, MAX_EPOCHS + 1):
+    # ========================================================
+    # TRAINING LOOP
+    # ========================================================
 
-        loss = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            loss_function,
-            scaler,
-            device
-        )
+    for epoch in range(MAX_EPOCHS):
+
+        model.train()
+
+        epoch_loss = 0
+
+        for batch in train_loader:
+
+            images = batch["image"].to(device)
+            labels = batch["label"].to(device)
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+            with torch.autocast(
+                device_type="cuda",
+                enabled=torch.cuda.is_available()
+            ):
+
+                outputs = model(images)
+
+                loss = loss_function(
+                    outputs,
+                    labels
+                )
+
+            scaler.scale(loss).backward()
+
+            scaler.step(optimizer)
+
+            scaler.update()
+
+            epoch_loss += loss.item()
 
         scheduler.step()
 
-        record = {
-            "epoch": epoch,
-            "train_loss": loss
-        }
+        epoch_loss /= len(train_loader)
 
-        if epoch % VAL_EVERY == 0:
+        print(
+            f"Fold {fold} | "
+            f"Epoch {epoch + 1}/{MAX_EPOCHS} | "
+            f"Loss = {epoch_loss:.4f}"
+        )
 
-            dice = validate(
-                model,
-                val_loader,
-                device
-            )
+        # ====================================================
+        # VALIDATION
+        # ====================================================
 
-            record["val_dice"] = dice
+        if (
+            (epoch + 1) % VAL_EVERY != 0
+            and epoch != MAX_EPOCHS - 1
+        ):
+            continue
 
-            print(
-                f"Fold {fold} | "
-                f"Epoch {epoch:03d} | "
-                f"Loss {loss:.4f} | "
-                f"Dice {dice:.4f}"
-            )
+        model.eval()
 
-            if dice > best_dice:
+        dice_metric.reset()
 
-                best_dice = dice
+        with torch.no_grad():
 
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "dice": dice
-                    },
-                    fold_dir / "best_model.pt"
+            for batch in val_loader:
+
+                images = batch["image"].to(device)
+
+                labels = batch["label"].to(device)
+
+                with torch.autocast(
+                    device_type="cuda",
+                    enabled=torch.cuda.is_available()
+                ):
+
+                    outputs = sliding_window_inference(
+                        inputs=images,
+                        roi_size=ROI_SIZE,
+                        sw_batch_size=SW_BATCH_SIZE,
+                        predictor=model,
+                        overlap=INFER_OVERLAP
+                    )
+
+                predictions = [
+                    post_pred(x)
+                    for x in outputs
+                ]
+
+                labels_list = [
+                    post_label(x)
+                    for x in labels
+                ]
+
+                dice_metric(
+                    y_pred=predictions,
+                    y=labels_list
                 )
 
-                print(
-                    f"  New best model: Dice={dice:.4f}"
-                )
+        class_dice = (
+            dice_metric
+            .aggregate()
+            .cpu()
+            .numpy()
+        )
 
-        else:
+        dice_metric.reset()
 
-            print(
-                f"Fold {fold} | "
-                f"Epoch {epoch:03d} | "
-                f"Loss {loss:.4f}"
+        # class_dice contains:
+        # [pancreas, tumour]
+        pancreas_dice = float(
+            class_dice[0]
+        )
+
+        tumor_dice = float(
+            class_dice[1]
+        )
+
+        mean_dice = float(
+            np.nanmean(class_dice)
+        )
+
+        print(
+            f"Validation | "
+            f"Pancreas DSC = {pancreas_dice:.4f} | "
+            f"Tumour DSC = {tumor_dice:.4f} | "
+            f"Mean = {mean_dice:.4f}"
+        )
+
+        history.append({
+            "epoch": epoch + 1,
+            "loss": epoch_loss,
+            "pancreas_dice": pancreas_dice,
+            "tumor_dice": tumor_dice,
+            "mean_dice": mean_dice
+        })
+
+        # ----------------------------------------------------
+        # Save best model
+        # ----------------------------------------------------
+
+        if mean_dice > best_dice:
+
+            best_dice = mean_dice
+            best_epoch = epoch + 1
+
+            torch.save(
+                {
+                    "epoch": best_epoch,
+                    "model_state_dict":
+                        model.state_dict(),
+                    "optimizer_state_dict":
+                        optimizer.state_dict(),
+                    "best_dice":
+                        best_dice
+                },
+                fold_dir / "best_model.pt"
             )
 
-        history.append(record)
+            print(
+                f"New best model: "
+                f"DSC={best_dice:.4f}"
+            )
+
+    # --------------------------------------------------------
+    # Save training history
+    # --------------------------------------------------------
 
     with open(
-        fold_dir / "history.json",
-        "w"
+        fold_dir / "history.csv",
+        "w",
+        newline=""
     ) as f:
 
-        json.dump(
-            history,
+        writer = csv.DictWriter(
             f,
-            indent=2
+            fieldnames=[
+                "epoch",
+                "loss",
+                "pancreas_dice",
+                "tumor_dice",
+                "mean_dice"
+            ]
         )
 
+        writer.writeheader()
+        writer.writerows(history)
+
+    # ========================================================
+    # Load best model
+    # ========================================================
+
+    checkpoint = torch.load(
+        fold_dir / "best_model.pt",
+        map_location=device
+    )
+
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
+
+    # ========================================================
+    # Save validation predictions
+    # ========================================================
+
+    save_validation_predictions(
+        model=model,
+        val_loader=val_loader,
+        fold=fold,
+        device=device
+    )
+
+    print()
     print(
-        f"\nFold {fold} best Dice: {best_dice:.4f}"
+        f"Fold {fold} completed. "
+        f"Best mean DSC={best_dice:.4f} "
+        f"at epoch {best_epoch}"
     )
-
-    return best_dice
 
 
 # ============================================================
-# 5-FOLD CROSS VALIDATION
+# MAIN
 # ============================================================
-
-def create_folds(cases, seed=42):
-
-    from sklearn.model_selection import KFold
-
-    kfold = KFold(
-        n_splits=5,
-        shuffle=True,
-        random_state=seed
-    )
-
-    folds = []
-
-    for train_idx, val_idx in kfold.split(cases):
-
-        train_cases = [
-            cases[i]
-            for i in train_idx
-        ]
-
-        val_cases = [
-            cases[i]
-            for i in val_idx
-        ]
-
-        folds.append(
-            {
-                "train": train_cases,
-                "val": val_cases
-            }
-        )
-
-    return folds
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
-def main():
-
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--data_dir",
-        required=True
-    )
-
-    parser.add_argument(
-        "--output_dir",
-        default="./results"
-    )
-
-    parser.add_argument(
-        "--fold",
-        type=int,
-        default=None
-    )
-
-    args = parser.parse_args()
-
-    set_seed(SEED)
-
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    print("Using device:", device)
-
-    cases = get_case_files(
-        args.data_dir
-    )
-
-    folds = create_folds(
-        cases,
-        SEED
-    )
-
-    # Save fold assignments
-    split_dir = Path(args.data_dir) / "splits"
-    split_dir.mkdir(exist_ok=True)
-
-    for i, fold in enumerate(folds):
-
-        with open(
-            split_dir / f"fold_{i}.json",
-            "w"
-        ) as f:
-
-            json.dump(
-                {
-                    "train": [
-                        x["case_id"]
-                        for x in fold["train"]
-                    ],
-                    "val": [
-                        x["case_id"]
-                        for x in fold["val"]
-                    ]
-                },
-                f,
-                indent=2
-            )
-
-    if args.fold is not None:
-
-        fold = args.fold
-
-        train_fold(
-            folds[fold]["train"],
-            folds[fold]["val"],
-            fold,
-            args.output_dir,
-            device
-        )
-
-    else:
-
-        results = []
-
-        for fold in range(5):
-
-            dice = train_fold(
-                folds[fold]["train"],
-                folds[fold]["val"],
-                fold,
-                args.output_dir,
-                device
-            )
-
-            results.append(dice)
-
-        print()
-        print("=" * 70)
-        print("5-FOLD RESULTS")
-        print("=" * 70)
-
-        for i, dice in enumerate(results):
-
-            print(
-                f"Fold {i}: {dice:.4f}"
-            )
-
-        print(
-            f"\nMean Dice: {np.mean(results):.4f}"
-        )
-
-        print(
-            f"SD Dice:   {np.std(results):.4f}"
-        )
-
 
 if __name__ == "__main__":
-    main()
+
+    for fold in range(N_FOLDS):
+        train_fold(fold)
